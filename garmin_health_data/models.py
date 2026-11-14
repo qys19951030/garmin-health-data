@@ -1331,8 +1331,8 @@ class ExtractionFailure(Base, UpsertBase):
 
     One row per distinct failure, identified by (user_id, data_type, failure_date,
     activity_id): a repeated failure merges into the existing row and bumps
-    `failure_count`. Per-day failures carry `failure_date`; per-activity failures
-    carry `activity_id`; per-range and per-data-type failures carry neither and never
+    `failure_count`. Per-day failures carry `failure_date`; per-activity failures carry
+    `activity_id`; per-range and per-data-type failures carry neither and never
     influence the auto-detected start date. `resolved_ts` is set when a later run
     fetches and saves data covering the failure; resolved rows stay queryable but no
     longer extend the extraction window. No FK to `user`: a failure can be recorded

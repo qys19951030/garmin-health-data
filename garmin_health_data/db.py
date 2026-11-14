@@ -7,12 +7,12 @@ Handles SQLite database creation, session management, and query utilities.
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import click
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import Session
 
 # Handle importlib.resources for different Python versions
@@ -24,6 +24,7 @@ else:
 from garmin_health_data.models import (
     Activity,
     BodyBattery,
+    ExtractionFailure,
     Floors,
     HeartRate,
     IntensityMinutes,
@@ -311,3 +312,257 @@ def database_exists(db_path: str = "garmin_data.db") -> bool:
     """
     db_file = Path(db_path).expanduser()
     return db_file.exists()
+
+
+def _parse_failure_date(date_str: str) -> Optional[date]:
+    """
+    Parse an ``ExtractionFailure.date`` label into a calendar date.
+
+    Only a plain ISO date (``YYYY-MM-DD``) maps to a ledger ``failure_date``. Range
+    labels (``"<start>..<end>"``) and empty labels (per-data-type failures) return
+    ``None``: those failures are recorded for inspection but never influence the auto-
+    detected start date.
+
+    :param date_str: Date label from the extractor's failure/success record.
+    :return: Parsed date, or None when the label carries no single-day context.
+    """
+    if not date_str or ".." in date_str:
+        return None
+    try:
+        return date.fromisoformat(date_str)
+    except ValueError:
+        return None
+
+
+def _ledger_table_exists(session: Session) -> bool:
+    """
+    Report whether the ``extraction_failure`` table exists in the database.
+
+    Pre-upgrade databases only gain the table on the next ``extract`` run (which
+    executes ``tables.ddl``), so read-only commands must tolerate its absence.
+
+    :param session: Active SQLAlchemy session.
+    :return: True when the gap-ledger table is present.
+    """
+    result = session.execute(
+        text(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'extraction_failure'"
+        )
+    ).scalar()
+    return result is not None
+
+
+def record_extraction_failures(db_path: str, failures: list) -> int:
+    """
+    Record extraction failures into the gap ledger, merging repeats into one row.
+
+    Each failure is keyed by ``(user_id, data_type, failure_date, activity_id)``. A
+    first occurrence inserts a row; a re-occurrence of the same key bumps
+    ``failure_count`` and refreshes ``last_failure_ts`` / ``last_error``. A failure that
+    recurs after being resolved reopens the row (``resolved_ts`` back to NULL) so the
+    gap re-enters the auto-start window calculation.
+
+    Failures without a ``user_id`` (e.g. constructed outside the per-account extraction
+    loop) cannot be attributed to an account and are skipped.
+
+    :param db_path: Path to SQLite database file.
+    :param failures: List of extractor ``ExtractionFailure`` records (duck-typed:
+        ``user_id``, ``data_type``, ``date``, ``activity_id``, ``error``).
+    :return: Number of failures recorded.
+    """
+    attributable = [f for f in failures if getattr(f, "user_id", "")]
+    if not attributable:
+        return 0
+
+    now = datetime.now()
+    with get_session(db_path) as session:
+        for failure in attributable:
+            failure_date = _parse_failure_date(failure.date)
+            activity_id = int(failure.activity_id) if failure.activity_id else None
+            statement = select(ExtractionFailure).where(
+                ExtractionFailure.user_id == int(failure.user_id),
+                ExtractionFailure.data_type == failure.data_type,
+                (
+                    ExtractionFailure.failure_date.is_(None)
+                    if failure_date is None
+                    else ExtractionFailure.failure_date == failure_date
+                ),
+                (
+                    ExtractionFailure.activity_id.is_(None)
+                    if activity_id is None
+                    else ExtractionFailure.activity_id == activity_id
+                ),
+            )
+            existing = session.execute(statement).scalar_one_or_none()
+            if existing is not None:
+                existing.failure_count += 1
+                existing.last_failure_ts = now
+                existing.last_error = failure.error
+                # A re-occurrence after resolution reopens the gap.
+                existing.resolved_ts = None
+            else:
+                session.add(
+                    ExtractionFailure(
+                        user_id=int(failure.user_id),
+                        data_type=failure.data_type,
+                        failure_date=failure_date,
+                        activity_id=activity_id,
+                        first_failure_ts=now,
+                        last_failure_ts=now,
+                        failure_count=1,
+                        last_error=failure.error,
+                        resolved_ts=None,
+                    )
+                )
+    return len(attributable)
+
+
+def resolve_extraction_failures(db_path: str, successes: list) -> int:
+    """
+    Mark gap-ledger rows resolved when a run actually fetched and saved their data.
+
+    A success matches unresolved rows with the same ``(user_id, data_type)`` and
+    the same context: per-day successes resolve rows with that ``failure_date``,
+    per-activity successes resolve rows with that ``activity_id``, and context-free
+    successes (range / no-date types) resolve rows with neither. Resolved rows stay
+    in the table for inspection but no longer extend the extraction window.
+
+    :param db_path: Path to SQLite database file.
+    :param successes: List of extractor ``ExtractionSuccess`` records (duck-typed:
+        ``user_id``, ``data_type``, ``date``, ``activity_id``).
+    :return: Number of ledger rows marked resolved.
+    """
+    attributable = [s for s in successes if getattr(s, "user_id", "")]
+    if not attributable:
+        return 0
+
+    resolved = 0
+    now = datetime.now()
+    with get_session(db_path) as session:
+        for success in attributable:
+            statement = select(ExtractionFailure).where(
+                ExtractionFailure.user_id == int(success.user_id),
+                ExtractionFailure.data_type == success.data_type,
+                ExtractionFailure.resolved_ts.is_(None),
+            )
+            activity_id = int(success.activity_id) if success.activity_id else None
+            success_date = _parse_failure_date(success.date)
+            if activity_id is not None:
+                statement = statement.where(
+                    ExtractionFailure.activity_id == activity_id
+                )
+            elif success_date is not None:
+                statement = statement.where(
+                    ExtractionFailure.failure_date == success_date,
+                    ExtractionFailure.activity_id.is_(None),
+                )
+            else:
+                statement = statement.where(
+                    ExtractionFailure.failure_date.is_(None),
+                    ExtractionFailure.activity_id.is_(None),
+                )
+            for row in session.execute(statement).scalars():
+                row.resolved_ts = now
+                resolved += 1
+    return resolved
+
+
+def get_earliest_unresolved_failure_date(
+    db_path: str, user_id: str, since: Optional[date] = None
+) -> Optional[date]:
+    """
+    Get the earliest unresolved per-day failure date for one account.
+
+    Only per-day failures (``failure_date`` set) participate: per-activity, per-range,
+    and per-data-type failures never influence the auto-detected start date. ``since``
+    bounds how far back the gap backfill may reach; older unresolved failures stay in
+    the ledger for manual handling.
+
+    :param db_path: Path to SQLite database file.
+    :param user_id: Garmin user ID (string form, as used by account discovery).
+    :param since: Optional inclusive lower bound on ``failure_date``.
+    :return: Earliest unresolved failure date, or None.
+    """
+    with get_session(db_path) as session:
+        if not _ledger_table_exists(session):
+            return None
+        statement = select(func.min(ExtractionFailure.failure_date)).where(
+            ExtractionFailure.user_id == int(user_id),
+            ExtractionFailure.resolved_ts.is_(None),
+            ExtractionFailure.failure_date.isnot(None),
+        )
+        if since is not None:
+            statement = statement.where(ExtractionFailure.failure_date >= since)
+        return session.execute(statement).scalar()
+
+
+def get_unresolved_failure_summary(
+    db_path: str, user_ids: Optional[List[int]] = None
+) -> List[Dict]:
+    """
+    Summarize unresolved gap-ledger rows grouped by account and data type.
+
+    :param db_path: Path to SQLite database file.
+    :param user_ids: Optional list of integer user IDs to scope to. None means all
+        accounts.
+    :return: List of dicts (one per ``(user_id, data_type)`` group) with keys
+        ``user_id``, ``data_type``, ``entries`` (distinct ledger rows),
+        ``failure_count`` (total occurrences), ``earliest_date`` and ``latest_date``
+        (over per-day failures; None when the group has no dated rows), and
+        ``last_error`` (error of the most recent occurrence). Sorted by ``(user_id,
+        data_type)``. Empty when the ledger table does not exist yet (pre-upgrade
+        database).
+    """
+    with get_session(db_path) as session:
+        if not _ledger_table_exists(session):
+            return []
+        statement = select(ExtractionFailure).where(
+            ExtractionFailure.resolved_ts.is_(None)
+        )
+        if user_ids:
+            statement = statement.where(ExtractionFailure.user_id.in_(list(user_ids)))
+        rows = session.execute(
+            statement.order_by(ExtractionFailure.user_id, ExtractionFailure.data_type)
+        ).scalars()
+
+        groups: Dict[tuple, Dict] = {}
+        for row in rows:
+            key = (row.user_id, row.data_type)
+            group = groups.setdefault(
+                key,
+                {
+                    "user_id": row.user_id,
+                    "data_type": row.data_type,
+                    "entries": 0,
+                    "failure_count": 0,
+                    "earliest_date": None,
+                    "latest_date": None,
+                    "last_error": "",
+                    "_latest_ts": None,
+                },
+            )
+            group["entries"] += 1
+            group["failure_count"] += row.failure_count
+            if row.failure_date is not None:
+                if (
+                    group["earliest_date"] is None
+                    or row.failure_date < group["earliest_date"]
+                ):
+                    group["earliest_date"] = row.failure_date
+                if (
+                    group["latest_date"] is None
+                    or row.failure_date > group["latest_date"]
+                ):
+                    group["latest_date"] = row.failure_date
+            if (
+                group["_latest_ts"] is None
+                or row.last_failure_ts >= group["_latest_ts"]
+            ):
+                group["_latest_ts"] = row.last_failure_ts
+                group["last_error"] = row.last_error
+
+        summary = list(groups.values())
+        for group in summary:
+            del group["_latest_ts"]
+        return summary

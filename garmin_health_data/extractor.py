@@ -110,12 +110,40 @@ class ExtractionFailure:
         otherwise.
     :ivar error: Human-readable error description (typically ``"<ExceptionType>:
         <message>"``).
+    :ivar user_id: Garmin user ID (string form) of the account whose extraction failed.
+        Stamped by :func:`extract` when merging per-account failures; ``""`` for records
+        constructed outside that loop.
     """
 
     data_type: str
     date: str
     activity_id: str
     error: str
+    user_id: str = ""
+
+
+@dataclass
+class ExtractionSuccess:
+    """
+    A single successful extraction recorded for gap-ledger resolution.
+
+    Mirrors :class:`ExtractionFailure` so the CLI can mark ledger rows resolved
+    when a later run actually fetches and saves data for the same
+    ``(account, data type, date or activity)``.
+
+    :ivar data_type: Garmin data type name (e.g. ``"SLEEP"``, ``"ACTIVITY"``).
+    :ivar date: ISO date string (``"YYYY-MM-DD"``) for per-day saves, or ``""``
+        when no single-day context applies (range / no-date saves).
+    :ivar activity_id: Activity ID as a string for per-activity saves, or ``""``
+        otherwise.
+    :ivar user_id: Garmin user ID (string form) of the account. Stamped by
+        :func:`extract` when merging per-account successes.
+    """
+
+    data_type: str
+    date: str
+    activity_id: str
+    user_id: str = ""
 
 
 # Data types whose already-extracted past days can change retroactively when the user

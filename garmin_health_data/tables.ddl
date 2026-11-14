@@ -920,3 +920,34 @@ CREATE TABLE IF NOT EXISTS activity_ts_metric_downsampled (
 -- the wellness time-series tables (heart_rate, body_battery, etc.).
 CREATE INDEX IF NOT EXISTS activity_ts_metric_downsampled_name_bucket_ts_idx
 ON activity_ts_metric_downsampled (name, bucket_ts DESC);
+
+-- Ledger of extraction failures (the "gap ledger"). One row per distinct failure, keyed by (user_id, data_type, failure_date, activity_id): a repeated failure merges into the existing row and bumps failure_count instead of adding rows. Per-day failures carry failure_date; per-activity failures carry activity_id; per-range and per-data-type failures carry neither (they are recorded for inspection but never influence the auto-detected start date). resolved_ts is set when a later run actually fetches and saves data for the same (account, data type, date or activity); resolved rows stay queryable but no longer extend the extraction window. No FK to user(user_id): a failure can be recorded before any profile data lands in the user table.
+CREATE TABLE IF NOT EXISTS extraction_failure (
+    failure_id INTEGER PRIMARY KEY AUTOINCREMENT
+    , user_id BIGINT NOT NULL              -- Garmin user ID of the account whose extraction failed. Deliberately not a foreign key: failures can precede any user row.
+    , data_type TEXT NOT NULL              -- Garmin data type name (e.g., SLEEP, HEART_RATE, ACTIVITY).
+    , failure_date DATE                    -- Calendar date for per-day failures. NULL for per-activity, per-range, and per-data-type failures.
+    , activity_id BIGINT                   -- Garmin activity ID for per-activity failures. NULL otherwise.
+    , first_failure_ts DATETIME NOT NULL   -- Timestamp when this failure was first recorded.
+    , last_failure_ts DATETIME NOT NULL    -- Timestamp when this failure was most recently recorded.
+    , failure_count INTEGER NOT NULL DEFAULT 1  -- Number of times this failure has been recorded. Incremented on each re-occurrence.
+    , last_error TEXT NOT NULL             -- Error description from the most recent occurrence (typically '<ExceptionType>: <message>').
+    , resolved_ts DATETIME                 -- Timestamp when a later run fetched and saved data covering this failure. NULL while the gap is unresolved.
+    , create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was created in the database.
+    , update_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP  -- Timestamp when the record was last modified in the database.
+);
+
+-- One ledger row per distinct failure. COALESCE sentinels make NULL failure_date /
+-- activity_id comparable so per-range and per-data-type failures (both NULL) also
+-- merge into a single row instead of accumulating duplicates.
+CREATE UNIQUE INDEX IF NOT EXISTS extraction_failure_identity_idx
+ON extraction_failure (
+    user_id
+    , data_type
+    , COALESCE(failure_date, '')
+    , COALESCE(activity_id, 0)
+);
+
+-- Auto-start gap detection scans unresolved per-day failures for one account.
+CREATE INDEX IF NOT EXISTS extraction_failure_unresolved_date_idx
+ON extraction_failure (user_id, resolved_ts, failure_date);

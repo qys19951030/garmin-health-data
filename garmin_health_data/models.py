@@ -1323,3 +1323,38 @@ class MenstrualCycleSummary(Base, UpsertBase):
     start_date = Column(Date, primary_key=True)
     period_length = Column(Integer)
     predicted_cycle = Column(Boolean, nullable=False)
+
+
+class ExtractionFailure(Base, UpsertBase):
+    """
+    Ledger of extraction failures (the "gap ledger").
+
+    One row per distinct failure, identified by (user_id, data_type, failure_date,
+    activity_id): a repeated failure merges into the existing row and bumps
+    `failure_count`. Per-day failures carry `failure_date`; per-activity failures
+    carry `activity_id`; per-range and per-data-type failures carry neither and never
+    influence the auto-detected start date. `resolved_ts` is set when a later run
+    fetches and saves data covering the failure; resolved rows stay queryable but no
+    longer extend the extraction window. No FK to `user`: a failure can be recorded
+    before any profile data lands in the user table.
+    """
+
+    __tablename__ = "extraction_failure"
+
+    # Record identification.
+    failure_id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(BigInteger, nullable=False)
+    data_type = Column(String, nullable=False)
+
+    # Failure context (exactly one of failure_date / activity_id, or neither).
+    failure_date = Column(Date)
+    activity_id = Column(BigInteger)
+
+    # Occurrence tracking.
+    first_failure_ts = Column(DateTime, nullable=False)
+    last_failure_ts = Column(DateTime, nullable=False)
+    failure_count = Column(Integer, nullable=False, default=1)
+    last_error = Column(Text, nullable=False)
+
+    # Resolution. NULL while the gap is unresolved.
+    resolved_ts = Column(DateTime)

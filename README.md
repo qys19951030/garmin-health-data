@@ -291,6 +291,7 @@ The data lives in a single SQLite file (default `./garmin_data.db`). Query it wi
 | [`garmin extract`](#garmin-extract) | Download data from Garmin Connect and load it into the SQLite database. The default workflow. Supports rolling-window auto retention via opt-in flags. | [extract](#garmin-extract) |
 | [`garmin info`](#garmin-info) | Show row counts, last-update dates, and DB size. Read-only. | [info](#garmin-info) |
 | [`garmin verify`](#garmin-verify) | Check schema integrity and run SQLite's `PRAGMA integrity_check`. Read-only. | [verify](#garmin-verify) |
+| [`garmin gaps`](#garmin-gaps) | List unresolved extraction failures (the gap ledger) by account and data type. Read-only. | [gaps](#garmin-gaps) |
 | [`garmin downsample`](#garmin-downsample) | Aggregate `activity_ts_metric` into time-bucketed records in `activity_ts_metric_downsampled`. Source rows are not modified. | [retention](#retention-prune-downsample-migrate-cascade) |
 | [`garmin prune`](#garmin-prune) | Delete `activity_ts_metric` rows for activities in a date range. The disk-reclaim partner of `downsample`. | [retention](#retention-prune-downsample-migrate-cascade) |
 | [`garmin migrate-cascade`](#garmin-migrate-cascade) | One-shot retrofit of `ON DELETE CASCADE` onto pre-2.9 databases. Run once after upgrading from 2.8.x or earlier. | [retention](#retention-prune-downsample-migrate-cascade) |
@@ -359,6 +360,8 @@ A single transient failure does not abort the run. Failures are isolated and rep
 
 **End-of-run summary**: every recorded failure is listed at the end of the run, grouped by data type, so you always know exactly what was skipped and can target a re-run with explicit `--start-date` / `--end-date`.
 
+**Gap ledger**: every failure is also persisted to the `extraction_failure` table (see [`garmin gaps`](#garmin-gaps)), so the evidence survives after the process exits. The next `garmin extract` without `--start-date` automatically backfills unresolved per-day gaps (up to 30 days back, per account) and marks each gap resolved once its data actually lands.
+
 </details>
 
 <details>
@@ -375,6 +378,7 @@ A single transient failure does not abort the run. Failures are isolated and rep
 
 1. **First run (empty database)**: extracts the last 30 days.
 2. **Subsequent runs (existing data)**: queries 10 core time-series tables (sleep, heart_rate, activity, stress, body_battery, steps, respiration, floors, intensity_minutes, training_readiness), takes the **maximum** date across them, and starts from the day after.
+3. **Gap backfill**: each account's start is then moved back to its earliest unresolved per-day failure in the `extraction_failure` ledger, if earlier — bounded to a 30-day look-back so an ancient gap never triggers a full-history re-pull. This is per account: one lagging account's window moves back without making the others re-pull. An explicit `--start-date` disables gap backfill entirely.
 
 Using the maximum (rather than per-table latest) means each automatic run covers all data types up to the most recent extraction, even if some types have no rows for some days (e.g. no activities recorded, no training readiness calculated). This keeps the resume logic simple, predictable, and free of redundant API calls.
 
@@ -456,6 +460,22 @@ Read-only. Reports the number of tables defined in the schema and runs SQLite's 
 
 Exits with code 0 when the integrity check passes. If it fails, prints every returned
 diagnostic and exits with code 1. A missing database also exits with code 1.
+
+### `garmin gaps`
+
+```bash
+garmin gaps
+garmin gaps --accounts 12345678 --db-path ~/my-garmin-data.db
+```
+
+Read-only. Lists **unresolved extraction failures** grouped by account and data type: number of distinct gaps, total occurrence count, earliest and latest failed dates, and the most recent error.
+
+Every extraction failure is recorded in the `extraction_failure` ledger table (one row per distinct account / data type / date-or-activity key, with first/last occurrence timestamps, an occurrence count, and the last error). When a later run actually fetches and saves data for the same key, the row is marked resolved — resolved rows stay in the table for inspection but are not shown here. When `--start-date` is omitted, the next `garmin extract` automatically extends each account's window back to its earliest unresolved per-day failure, up to 30 days back; older gaps stay in the ledger and need an explicit `--start-date` run.
+
+| Flag | Type | Purpose |
+| --- | --- | --- |
+| `--accounts ID` | Repeatable or comma-separated | Scope to specific Garmin user IDs. |
+| `--db-path PATH` | File path | SQLite database file. Defaults to `./garmin_data.db`. |
 
 ### Retention: `prune`, `downsample`, `migrate-cascade`
 
@@ -565,7 +585,7 @@ The command is **idempotent** (a database that already has `parent_activity_id` 
 
 ### Database Schema
 
-The SQLite database contains 42 tables organized by category. The complete schema is defined in [garmin_health_data/tables.ddl](garmin_health_data/tables.ddl) following the same pattern as the [openetl project](https://github.com/diegoscarabelli/openetl). The schema includes inline documentation comments for all tables and columns, which are preserved in the SQLite database itself:
+The SQLite database contains 43 tables organized by category. The complete schema is defined in [garmin_health_data/tables.ddl](garmin_health_data/tables.ddl) following the same pattern as the [openetl project](https://github.com/diegoscarabelli/openetl). The schema includes inline documentation comments for all tables and columns, which are preserved in the SQLite database itself:
 
 ```bash
 # View schema for a specific table
@@ -701,6 +721,14 @@ menstrual_cycle_summary (per-cycle summaries: start date, period length, predict
 
 *Foreign keys: `menstrual_cycle_day` → `user.user_id`; `menstrual_cycle_tag` → `menstrual_cycle_day(user_id, date)` ON DELETE CASCADE; `menstrual_cycle_summary` → `user.user_id`. Per-cycle summaries from Garmin's calendar endpoint include both user-logged cycles and Garmin's projections of upcoming cycles (predicted_cycle column). Predicted rows are wiped and re-inserted on every extract because Garmin recomputes projections as new data is logged; observed rows are upserted by `(user_id, start_date)`.*
 
+**Pipeline Metadata (1 table)**
+
+```
+extraction_failure (gap ledger: one row per distinct extraction failure, with occurrence count and resolution timestamp)
+```
+
+*No foreign keys: a failure can be recorded before any profile data lands in the `user` table. Populated by `garmin extract`; inspected via [`garmin gaps`](#garmin-gaps).*
+
 </details>
 
 ## Privacy & Security
@@ -712,7 +740,7 @@ menstrual_cycle_summary (per-cycle summaries: start date, period length, predict
 
 ## Comparison With Other Tools
 
-**[garmin-health-data](https://github.com/diegoscarabelli/garmin-health-data)** is designed for comprehensive data extraction with a well-structured relational schema that supports both human-powered analytics and LLM-powered analysis via agents querying the locally created SQLite file. It extracts complete FIT file data with per-second activity metrics, 1-minute sleep intervals, and sport-specific tables for detailed analysis. The normalized 42-table schema with explicit SQL constraints ensures data integrity and makes it easy to understand relationships for complex queries, power zone analysis, running dynamics, and long-term trend studies.
+**[garmin-health-data](https://github.com/diegoscarabelli/garmin-health-data)** is designed for comprehensive data extraction with a well-structured relational schema that supports both human-powered analytics and LLM-powered analysis via agents querying the locally created SQLite file. It extracts complete FIT file data with per-second activity metrics, 1-minute sleep intervals, and sport-specific tables for detailed analysis. The normalized 43-table schema with explicit SQL constraints ensures data integrity and makes it easy to understand relationships for complex queries, power zone analysis, running dynamics, and long-term trend studies.
 
 **[garmy](https://github.com/bes-dev/garmy)** is optimized for programmatic access to the Garmin Connect API, particularly useful for AI assistant integration via its built-in MCP (Model Context Protocol) server. It enables real-time interaction with Claude Desktop or custom chatbots for quick daily insights and summaries. However, it's limited to API-provided metrics (daily aggregates only, no FIT file access), making deep analytics or granular time-series analysis impossible. Best suited for lightweight health monitoring apps that prioritize AI integration over comprehensive data collection.
 
@@ -739,7 +767,7 @@ split below; garmin-health-data anchors both for reference.
 | **Sleep data granularity** | ✅ 7 tables, 1-min intervals | ⚠️ 2 tables, less granular | ⚠️ 1 table, daily aggregate | ⚠️ Stage durations only, no per-minute table | ⚠️ Daily/summary only |
 | **FIT file time-series data** | ✅ All metrics (EAV schema) | ⚠️ Limited (~10 core fields) | ❌ API-only (no FIT files) | ⚠️ Fixed-column trackpoints, no running/cycling dynamics | ❌ Summary only, no GPS/sample streams |
 | **Power meter & advanced metrics** | ✅ Full support | ❌ Not captured | ❌ API limitations | ⚠️ Basic power value only | ❌ Not captured |
-| **Database schema quality** | ✅ Normalized, 42 tables | ⚠️ ~31 tables, mixed normalization | ❌ Very simple | ⚠️ 50 tables, fixed columns | ⚠️ Simple, rebuildable from raw JSON |
+| **Database schema quality** | ✅ Normalized, 43 tables | ⚠️ ~31 tables, mixed normalization | ❌ Very simple | ⚠️ 50 tables, fixed columns | ⚠️ Simple, rebuildable from raw JSON |
 | **Duplicate prevention** | ✅ Explicit SQL ON CONFLICT | ⚠️ ORM merge (undocumented) | ✅ ORM merge + sync tracking | ✅ Explicit upserts | ✅ Idempotent sync |
 | **Auto-resume** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Active maintenance** | ✅ | ✅ | ✅ | ✅ | ✅ |

@@ -2193,6 +2193,7 @@ def test_extract_short_circuits_when_start_after_end(tmp_path):
         "garmin_files": 0,
         "activity_files": 0,
         "failures": [],
+        "successes": [],
         "failed_accounts": [],
     }
     mock_discover.assert_not_called()
@@ -2553,3 +2554,269 @@ def test_save_garmin_data_writes_offset_free_filename(tmp_path):
     assert name == "1_STEPS_2025-01-01T12-00-00Z.json"
     assert "+" not in name
     assert ":" not in name
+
+
+# --------------------------------------------------------------------------------------
+# Gap-ledger success recording and per-account start dates
+# --------------------------------------------------------------------------------------
+
+
+def test_day_by_day_records_successes_for_saved_days(tmp_path):
+    """
+    Each saved day records an ExtractionSuccess; failed and no-data days do not.
+    """
+    extractor = GarminExtractor(
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 3),
+        ingest_dir=tmp_path,
+        data_types=("SLEEP",),
+    )
+    extractor.user_id = "test-user"
+
+    sleep_type = GARMIN_DATA_REGISTRY.get_by_name("SLEEP")
+    mock_api = MagicMock(
+        side_effect=[
+            {"value": "ok-day-1"},
+            RuntimeError("transient API hiccup"),
+            None,  # No data for day 3.
+        ]
+    )
+    extractor.garmin_client = MagicMock()
+    setattr(extractor.garmin_client, sleep_type.api_method, mock_api)
+
+    extractor._extract_day_by_day(sleep_type, date(2025, 1, 1), date(2025, 1, 3))
+
+    assert [(s.data_type, s.date) for s in extractor.successes] == [
+        ("SLEEP", "2025-01-01")
+    ]
+
+
+def test_extract_range_records_per_day_and_context_free_successes(tmp_path):
+    """
+    A RANGE type with a per-day splitter records one success per saved day plus a
+    context-free success (to resolve a previous per-range failure).
+    """
+    extractor = GarminExtractor(
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 2),
+        ingest_dir=tmp_path,
+        data_types=("BODY_COMPOSITION",),
+    )
+    extractor.user_id = "test-user"
+
+    bc_type = GARMIN_DATA_REGISTRY.get_by_name("BODY_COMPOSITION")
+    payload = {
+        "dailyWeightSummaries": [
+            {
+                "summaryDate": "2025-01-01",
+                "allWeightMetrics": [{"timestampGMT": 1735689600000, "weight": 70}],
+            },
+            {
+                "summaryDate": "2025-01-02",
+                "allWeightMetrics": [{"timestampGMT": 1735776000000, "weight": 71}],
+            },
+        ]
+    }
+    extractor.garmin_client = MagicMock()
+    setattr(
+        extractor.garmin_client,
+        bc_type.api_method,
+        MagicMock(return_value=payload),
+    )
+
+    saved = extractor._extract_range(bc_type, date(2025, 1, 1), date(2025, 1, 2))
+
+    assert len(saved) == 2
+    assert [(s.data_type, s.date) for s in extractor.successes] == [
+        ("BODY_COMPOSITION", "2025-01-01"),
+        ("BODY_COMPOSITION", "2025-01-02"),
+        ("BODY_COMPOSITION", ""),
+    ]
+
+
+def test_no_date_type_records_context_free_success(tmp_path):
+    """
+    A NO_DATE type records a context-free success after saving its file.
+    """
+    extractor = GarminExtractor(
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 1),
+        ingest_dir=tmp_path,
+        data_types=("USER_PROFILE",),
+    )
+    extractor.user_id = "test-user"
+    extractor.garmin_client = MagicMock()
+    extractor.garmin_client.full_name = "Test User"
+
+    profile_type = GARMIN_DATA_REGISTRY.get_by_name("USER_PROFILE")
+    setattr(
+        extractor.garmin_client,
+        profile_type.api_method,
+        MagicMock(return_value={"id": 1}),
+    )
+
+    saved = extractor._extract_data_by_type(
+        profile_type, date(2025, 1, 1), date(2025, 1, 1)
+    )
+
+    assert len(saved) == 1
+    assert [(s.data_type, s.date, s.activity_id) for s in extractor.successes] == [
+        ("USER_PROFILE", "", "")
+    ]
+
+
+def test_activity_download_records_per_activity_success(tmp_path):
+    """
+    Each saved activity file records an ExtractionSuccess keyed by activity ID.
+    """
+    extractor = GarminExtractor(
+        start_date=date(2025, 1, 1),
+        end_date=date(2025, 1, 1),
+        ingest_dir=tmp_path,
+        data_types=("ACTIVITY",),
+    )
+    extractor.user_id = "test-user"
+    extractor.garmin_client = MagicMock()
+    extractor.garmin_client.get_activities_by_date.return_value = [
+        {
+            "activityId": 111,
+            "startTimeLocal": "2025-01-01T10:00:00.0",
+            "activityType": {"typeKey": "running"},
+        },
+        {
+            "activityId": 222,
+            "startTimeLocal": "2025-01-01T18:00:00.0",
+            "activityType": {"typeKey": "running"},
+        },
+    ]
+    fit_bytes = _FIT_MAGIC + b"\x00" * 8
+    extractor.garmin_client.download_activity.side_effect = [
+        fit_bytes,
+        RuntimeError("download failed"),
+    ]
+
+    saved = extractor.extract_fit_activities()
+
+    assert len(saved) == 1
+    assert [(s.data_type, s.activity_id) for s in extractor.successes] == [
+        ("ACTIVITY", "111")
+    ]
+    assert any(f.activity_id == "222" for f in extractor.failures)
+
+
+class TestExtractPerAccountStartDates:
+    """
+    Tests for gap-backfill per-account start dates in extract().
+    """
+
+    @patch("garmin_health_data.auth.discover_accounts")
+    @patch("garmin_health_data.extractor.GarminExtractor")
+    def test_per_account_start_dates_override_global(
+        self, mock_extractor_class, mock_discover
+    ):
+        """
+        An account listed in account_start_dates gets its earlier start; other accounts
+        keep the global start date.
+        """
+        mock_discover.return_value = [
+            ("11111111", Path("/tokens/11111111")),
+            ("22222222", Path("/tokens/22222222")),
+        ]
+        mock_extractor = MagicMock()
+        mock_extractor.extract_garmin_data.return_value = [Path("file1.json")]
+        mock_extractor.extract_fit_activities.return_value = []
+        mock_extractor_class.return_value = mock_extractor
+
+        extract(
+            Path("/tmp/test"),
+            "2025-01-10",
+            "2025-01-12",
+            account_start_dates={"22222222": date(2025, 1, 1)},
+        )
+
+        starts = [call.args[0] for call in mock_extractor_class.call_args_list]
+        assert starts == [date(2025, 1, 10), date(2025, 1, 1)]
+
+    @patch("garmin_health_data.auth.discover_accounts")
+    @patch("garmin_health_data.extractor.GarminExtractor")
+    def test_account_with_empty_window_is_skipped(
+        self, mock_extractor_class, mock_discover
+    ):
+        """
+        An account whose effective start is after the end date is skipped individually
+        while a gap-backfilled account still extracts.
+        """
+        mock_discover.return_value = [
+            ("11111111", Path("/tokens/11111111")),
+            ("22222222", Path("/tokens/22222222")),
+        ]
+        mock_extractor = MagicMock()
+        mock_extractor.extract_garmin_data.return_value = [Path("file1.json")]
+        mock_extractor.extract_fit_activities.return_value = []
+        mock_extractor_class.return_value = mock_extractor
+
+        # Global start is after the end (database current), but account
+        # 22222222 has an unresolved-failure start inside the window.
+        result = extract(
+            Path("/tmp/test"),
+            "2025-01-13",
+            "2025-01-12",
+            account_start_dates={"22222222": date(2025, 1, 1)},
+        )
+
+        # Only the backfilled account constructed an extractor.
+        assert mock_extractor_class.call_count == 1
+        assert mock_extractor_class.call_args_list[0].args[0] == date(2025, 1, 1)
+        assert result["garmin_files"] == 1
+
+    @patch("garmin_health_data.auth.discover_accounts")
+    @patch("garmin_health_data.extractor.GarminExtractor")
+    def test_inverted_window_without_gap_starts_still_short_circuits(
+        self, mock_extractor_class, mock_discover
+    ):
+        """
+        Without per-account starts, an inverted window extracts nothing and never
+        discovers accounts.
+        """
+        result = extract(Path("/tmp/test"), "2025-01-13", "2025-01-12")
+
+        mock_discover.assert_not_called()
+        mock_extractor_class.assert_not_called()
+        assert result["garmin_files"] == 0
+        assert result["successes"] == []
+
+    @patch("garmin_health_data.auth.discover_accounts")
+    @patch("garmin_health_data.extractor.GarminExtractor")
+    def test_failures_and_successes_stamped_with_user_id(
+        self, mock_extractor_class, mock_discover
+    ):
+        """
+        Merged failures and successes carry the discovered account user_id so the CLI
+        can ledger and resolve them per account.
+        """
+        from garmin_health_data.extractor import (
+            ExtractionFailure,
+            ExtractionSuccess,
+        )
+
+        mock_discover.return_value = [("11111111", Path("/tokens/11111111"))]
+        mock_extractor = MagicMock()
+        mock_extractor.extract_garmin_data.return_value = [Path("file1.json")]
+        mock_extractor.extract_fit_activities.return_value = []
+        mock_extractor.failures = [
+            ExtractionFailure(
+                data_type="SLEEP",
+                date="2025-01-02",
+                activity_id="",
+                error="RuntimeError: boom",
+            )
+        ]
+        mock_extractor.successes = [
+            ExtractionSuccess(data_type="SLEEP", date="2025-01-01", activity_id="")
+        ]
+        mock_extractor_class.return_value = mock_extractor
+
+        result = extract(Path("/tmp/test"), "2025-01-01", "2025-01-03")
+
+        assert [f.user_id for f in result["failures"]] == ["11111111"]
+        assert [s.user_id for s in result["successes"]] == ["11111111"]

@@ -434,6 +434,7 @@ class GarminExtractor:
         self.garmin_client = None
         self.user_id = None
         self.failures: List[ExtractionFailure] = []
+        self.successes: List[ExtractionSuccess] = []
 
     def authenticate(self, token_store_dir: str = "~/.garminconnect") -> None:
         """
@@ -640,6 +641,15 @@ class GarminExtractor:
                     saved_files.extend(
                         self._save_garmin_data(data, data_type, current_date)
                     )
+                    # Record the per-day success so the CLI can resolve any
+                    # matching gap-ledger failure for this (account, type, date).
+                    self.successes.append(
+                        ExtractionSuccess(
+                            data_type=data_type.name,
+                            date=date_str,
+                            activity_id="",
+                        )
+                    )
                 else:
                     click.secho(
                         f"{data_type.emoji} {data_type.name}: No data for "
@@ -734,7 +744,11 @@ class GarminExtractor:
             splitter = _PER_DAY_SPLITTERS.get(data_type.name)
             if splitter is None:
                 # Unsplittable: one file stamped end_date, body contains all rows.
-                return self._save_garmin_data(data, data_type, end_date)
+                saved = self._save_garmin_data(data, data_type, end_date)
+                self.successes.append(
+                    ExtractionSuccess(data_type=data_type.name, date="", activity_id="")
+                )
+                return saved
 
             per_day = splitter(data)
             if not per_day:
@@ -748,6 +762,18 @@ class GarminExtractor:
             saved_files: List[Path] = []
             for day in sorted(per_day):
                 saved_files.extend(self._save_garmin_data(per_day[day], data_type, day))
+                self.successes.append(
+                    ExtractionSuccess(
+                        data_type=data_type.name,
+                        date=day.isoformat(),
+                        activity_id="",
+                    )
+                )
+            # Context-free success as well, so a previous per-range failure of
+            # this type (recorded without a date) is resolved too.
+            self.successes.append(
+                ExtractionSuccess(data_type=data_type.name, date="", activity_id="")
+            )
             return saved_files
         except Exception as e:
             click.secho(
@@ -881,7 +907,11 @@ class GarminExtractor:
                 if data_type.name == "USER_PROFILE":
                     data["full_name"] = self.garmin_client.full_name
 
-                return self._save_garmin_data(data, data_type, end_date)
+                saved = self._save_garmin_data(data, data_type, end_date)
+                self.successes.append(
+                    ExtractionSuccess(data_type=data_type.name, date="", activity_id="")
+                )
+                return saved
             click.secho(
                 f"{data_type.emoji} {data_type.name}: No data available.",
                 fg="yellow",
@@ -1210,6 +1240,15 @@ class GarminExtractor:
                     file_size = filepath.stat().st_size / 1024  # KB.
                     click.echo(f"Saved: {filename} ({file_size:.1f} KB).")
                     downloaded_files.append(filepath)
+                    # Record the per-activity success so the CLI can resolve
+                    # any matching gap-ledger failure for this activity.
+                    self.successes.append(
+                        ExtractionSuccess(
+                            data_type="ACTIVITY",
+                            date="",
+                            activity_id=str(activity_id),
+                        )
+                    )
 
             # Fetch exercise sets for strength training activities (when EXERCISE_SETS
             # or ACTIVITY is requested).
@@ -1368,6 +1407,7 @@ def extract(
     data_types: Optional[List[str]] = None,
     accounts: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
+    account_start_dates: Optional[Dict[str, date]] = None,
 ) -> Dict[str, Any]:
     """
     Download data from Garmin Connect for the specified date range.
@@ -1389,12 +1429,21 @@ def extract(
     :param accounts: Optional list of user_id strings to filter which accounts to
         extract. If None, extracts all discovered accounts.
     :param progress_callback: Optional callback function for progress updates.
+    :param account_start_dates: Optional per-account start dates (``{user_id: date}``)
+        overriding the global start date, used for gap backfill: accounts with
+        unresolved extraction failures get an earlier start while the other accounts
+        keep the global one. Accounts not listed use the global start date.
     :return: Dictionary with the following keys:
 
         - ``garmin_files`` (``int``): count of saved JSON data files.
         - ``activity_files`` (``int``): count of saved activity files (FIT/TCX/GPX/KML).
         - ``failures`` (``List[ExtractionFailure]``): per-date / per-data-type /
-          per-activity failures recorded by any per-account extractor.
+          per-activity failures recorded by any per-account extractor, each stamped
+          with the account's ``user_id``.
+        - ``successes`` (``List[ExtractionSuccess]``): per-date / per-type /
+          per-activity saves recorded by any per-account extractor, each stamped
+          with the account's ``user_id``. The CLI uses these to resolve gap-ledger
+          rows.
         - ``failed_accounts`` (``List[str]``): user IDs whose entire run raised
           an unhandled exception (rare; see logs).
 
@@ -1416,6 +1465,7 @@ def extract(
             "garmin_files": 0,
             "activity_files": 0,
             "failures": [],
+            "successes": [],
             "failed_accounts": [],
         }
 
@@ -1452,8 +1502,12 @@ def extract(
     # per-type retroactive look-back (e.g. MENSTRUAL_CYCLE_DAY's 90-day
     # refresh): that window was already re-fetched on the run that advanced the
     # database, and the next advancing run re-covers it, so a no-op re-run needs
-    # no calls.
-    if start_date > end_date:
+    # no calls. Per-account gap-backfill starts participate: a single account
+    # with an earlier unresolved-failure start is enough to run the extraction
+    # (the other accounts are then skipped individually below).
+    account_start_dates = account_start_dates or {}
+    effective_starts = [start_date, *account_start_dates.values()]
+    if min(effective_starts) > end_date:
         click.secho(
             f"Nothing to extract (start {start_date.isoformat()} is after end "
             f"{end_date.isoformat()}).",
@@ -1463,6 +1517,7 @@ def extract(
             "garmin_files": 0,
             "activity_files": 0,
             "failures": [],
+            "successes": [],
             "failed_accounts": [],
         }
 
@@ -1481,6 +1536,7 @@ def extract(
             "garmin_files": 0,
             "activity_files": 0,
             "failures": [],
+            "successes": [],
             "failed_accounts": [],
         }
 
@@ -1497,6 +1553,7 @@ def extract(
                 "garmin_files": 0,
                 "activity_files": 0,
                 "failures": [],
+                "successes": [],
                 "failed_accounts": [],
             }
 
@@ -1506,17 +1563,30 @@ def extract(
     all_garmin_files = []
     all_activity_files = []
     all_failures: List[ExtractionFailure] = []
+    all_successes: List[ExtractionSuccess] = []
     failed_accounts = []
 
     for user_id, token_dir in discovered:
         extractor: Optional[GarminExtractor] = None
+        # Gap backfill: an account with unresolved failures may get an earlier
+        # start than the global one; other accounts keep the global start.
+        account_start = account_start_dates.get(user_id, start_date)
+        if account_start > end_date:
+            click.echo()
+            click.secho(
+                f"Account {user_id}: nothing to extract (start "
+                f"{account_start.isoformat()} is after end "
+                f"{end_date.isoformat()}).",
+                fg="green",
+            )
+            continue
         try:
             click.echo()
             click.echo(
                 click.style(f"Extracting data for account {user_id}...", fg="cyan")
             )
 
-            extractor = GarminExtractor(start_date, end_date, ingest_dir, data_types)
+            extractor = GarminExtractor(account_start, end_date, ingest_dir, data_types)
             extractor.authenticate(token_store_dir=str(token_dir))
 
             # Extract Garmin data.
@@ -1556,9 +1626,16 @@ def extract(
             # Without this, a partial run that captured 5 per-day failures and
             # then crashed in extract_fit_activities would lose those 5 from
             # the summary. `extractor` is None if the constructor itself
-            # raised, in which case there's nothing to merge.
+            # raised, in which case there's nothing to merge. Both failures and
+            # successes are stamped with the discovered account user_id here so
+            # the CLI can ledger and resolve them per account.
             if extractor is not None:
+                for failure in extractor.failures:
+                    failure.user_id = user_id
                 all_failures.extend(extractor.failures)
+                for success in extractor.successes:
+                    success.user_id = user_id
+                all_successes.extend(extractor.successes)
 
     # Check if any data was extracted.
     if not all_garmin_files and not all_activity_files:
@@ -1569,6 +1646,7 @@ def extract(
             "garmin_files": 0,
             "activity_files": 0,
             "failures": all_failures,
+            "successes": all_successes,
             "failed_accounts": failed_accounts,
         }
 
@@ -1600,6 +1678,7 @@ def extract(
         "garmin_files": len(all_garmin_files),
         "activity_files": len(all_activity_files),
         "failures": all_failures,
+        "successes": all_successes,
         "failed_accounts": failed_accounts,
     }
 

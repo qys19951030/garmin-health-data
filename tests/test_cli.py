@@ -761,3 +761,367 @@ def test_extract_validates_exclude_options_before_auth(tmp_path):
 
     assert result.exit_code != 0
     mock_auth.assert_not_called()
+
+
+# --------------------------------------------------------------------------------------
+# Gap ledger: record / resolve on extract, per-account backfill, gaps command
+# --------------------------------------------------------------------------------------
+
+
+def _make_failure(
+    user_id, data_type, date_str, activity_id="", error="RuntimeError: boom"
+):
+    """
+    Build an extractor ExtractionFailure record for ledger seeding.
+    """
+    from garmin_health_data.extractor import ExtractionFailure
+
+    return ExtractionFailure(
+        data_type=data_type,
+        date=date_str,
+        activity_id=activity_id,
+        error=error,
+        user_id=user_id,
+    )
+
+
+def _seed_ledger(db_path, failures):
+    """
+    Record failures directly into the gap ledger of a test database.
+    """
+    from garmin_health_data.db import record_extraction_failures
+
+    record_extraction_failures(str(db_path), failures)
+
+
+def _invoke_extract_auto_dates(runner, db_path):
+    """
+    Invoke extract without --start-date / --end-date (auto-detection path).
+    """
+    return runner.invoke(extract, ["--db-path", str(db_path)])
+
+
+def test_extract_records_failures_to_ledger(tmp_path):
+    """
+    Failures returned by the extractor are persisted to the gap ledger.
+    """
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+
+    def stub_extract(*args, **kwargs):
+        return {
+            "garmin_files": 0,
+            "activity_files": 0,
+            "failures": [
+                _make_failure("11111111", "SLEEP", "2025-01-02"),
+            ],
+            "successes": [],
+            "failed_accounts": [],
+        }
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch("garmin_health_data.cli.extract_data", side_effect=stub_extract),
+    ):
+        result = _common_invoke(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert "gap ledger" in result.output
+
+    from garmin_health_data.db import get_unresolved_failure_summary
+
+    summary = get_unresolved_failure_summary(str(db_path))
+    assert len(summary) == 1
+    assert summary[0]["user_id"] == 11111111
+    assert summary[0]["data_type"] == "SLEEP"
+    assert summary[0]["entries"] == 1
+
+
+def test_extract_resolves_ledger_on_success(tmp_path):
+    """
+    A success for the same (account, type, date) marks the ledger row resolved.
+    """
+    from garmin_health_data.db import get_unresolved_failure_summary
+    from garmin_health_data.extractor import ExtractionSuccess
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+    _seed_ledger(db_path, [_make_failure("11111111", "SLEEP", "2025-01-02")])
+
+    def stub_extract(*args, **kwargs):
+        return {
+            "garmin_files": 1,
+            "activity_files": 0,
+            "failures": [],
+            "successes": [
+                ExtractionSuccess(
+                    data_type="SLEEP",
+                    date="2025-01-02",
+                    activity_id="",
+                    user_id="11111111",
+                )
+            ],
+            "failed_accounts": [],
+        }
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch("garmin_health_data.cli.extract_data", side_effect=stub_extract),
+    ):
+        result = _common_invoke(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert "Resolved 1" in result.output
+    assert get_unresolved_failure_summary(str(db_path)) == []
+
+
+def test_extract_backfills_unresolved_gaps_per_account(tmp_path):
+    """
+    The auto-detected window moves back only for the account with unresolved per-day
+    failures; the other account keeps the global start.
+    """
+    from datetime import date, timedelta
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+
+    gap_date = date.today() - timedelta(days=10)
+    _seed_ledger(db_path, [_make_failure("11111111", "SLEEP", gap_date.isoformat())])
+
+    captured = {}
+
+    def capture_extract(*args, **kwargs):
+        captured.update(kwargs)
+        return _stub_extract_no_files()
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch(
+            "garmin_health_data.cli.get_latest_date",
+            return_value=date.today() - timedelta(days=1),
+        ),
+        patch(
+            "garmin_health_data.cli.discover_accounts",
+            return_value=[
+                ("11111111", Path("/tokens/11111111")),
+                ("22222222", Path("/tokens/22222222")),
+            ],
+        ),
+        patch("garmin_health_data.cli.extract_data", side_effect=capture_extract),
+    ):
+        result = _invoke_extract_auto_dates(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    # Only the gap-affected account gets an earlier start.
+    assert captured["account_start_dates"] == {"11111111": gap_date}
+    assert "backfilling unresolved failures" in result.output
+
+
+def test_extract_backfill_bounded_to_30_days(tmp_path):
+    """
+    Failures older than the 30-day horizon stay in the ledger but do not move the auto-
+    detected window back.
+    """
+    from datetime import date, timedelta
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+
+    old_gap = date.today() - timedelta(days=40)
+    _seed_ledger(db_path, [_make_failure("11111111", "SLEEP", old_gap.isoformat())])
+
+    captured = {}
+
+    def capture_extract(*args, **kwargs):
+        captured.update(kwargs)
+        return _stub_extract_no_files()
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch(
+            "garmin_health_data.cli.get_latest_date",
+            return_value=date.today() - timedelta(days=1),
+        ),
+        patch(
+            "garmin_health_data.cli.discover_accounts",
+            return_value=[("11111111", Path("/tokens/11111111"))],
+        ),
+        patch("garmin_health_data.cli.extract_data", side_effect=capture_extract),
+    ):
+        result = _invoke_extract_auto_dates(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert captured["account_start_dates"] is None
+    # The old failure is still ledgered for manual handling.
+    from garmin_health_data.db import get_unresolved_failure_summary
+
+    assert len(get_unresolved_failure_summary(str(db_path))) == 1
+
+
+def test_extract_explicit_start_date_skips_backfill(tmp_path):
+    """
+    An explicit --start-date disables gap backfill entirely: the user's range is used
+    as-is and no per-account starts are computed.
+    """
+    from datetime import date, timedelta
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+
+    gap_date = date.today() - timedelta(days=10)
+    _seed_ledger(db_path, [_make_failure("11111111", "SLEEP", gap_date.isoformat())])
+
+    captured = {}
+
+    def capture_extract(*args, **kwargs):
+        captured.update(kwargs)
+        return _stub_extract_no_files()
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch("garmin_health_data.cli.extract_data", side_effect=capture_extract),
+    ):
+        result = _common_invoke(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert captured["account_start_dates"] is None
+    assert captured["data_interval_start"] == "2025-01-01"
+
+
+def test_extract_creates_ledger_table_on_old_database(tmp_path):
+    """
+    A pre-upgrade database without the ledger table gains it automatically on the next
+    extract run, and failures are recorded into it.
+    """
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE user (user_id BIGINT PRIMARY KEY, full_name TEXT, "
+        "birth_date DATE, create_ts DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    conn.execute("INSERT INTO user (user_id, full_name) VALUES (11111111, 'Ada')")
+    conn.commit()
+    conn.close()
+
+    def stub_extract(*args, **kwargs):
+        return {
+            "garmin_files": 0,
+            "activity_files": 0,
+            "failures": [_make_failure("11111111", "SLEEP", "2025-01-02")],
+            "successes": [],
+            "failed_accounts": [],
+        }
+
+    runner = CliRunner()
+    with (
+        patch("garmin_health_data.cli.ensure_authenticated"),
+        patch("garmin_health_data.cli.extract_data", side_effect=stub_extract),
+    ):
+        result = _common_invoke(runner, db_path)
+
+    assert result.exit_code == 0, result.output
+    conn = sqlite3.connect(db_path)
+    names = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    preserved = conn.execute(
+        "SELECT full_name FROM user WHERE user_id = 11111111"
+    ).fetchone()
+    conn.close()
+    assert "extraction_failure" in names
+    assert preserved == ("Ada",)
+
+    from garmin_health_data.db import get_unresolved_failure_summary
+
+    assert len(get_unresolved_failure_summary(str(db_path))) == 1
+
+
+def test_gaps_command_lists_unresolved_failures(tmp_path):
+    """
+    The gaps command groups unresolved failures by account and type with counts, date
+    bounds, and the most recent error.
+    """
+    from garmin_health_data.cli import gaps
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+    _seed_ledger(
+        db_path,
+        [
+            _make_failure("11111111", "SLEEP", "2025-01-02"),
+            _make_failure("11111111", "SLEEP", "2025-01-02"),
+            _make_failure(
+                "11111111", "SLEEP", "2025-01-05", error="RuntimeError: newer"
+            ),
+            _make_failure("22222222", "STRESS", "2025-01-03"),
+        ],
+    )
+
+    result = CliRunner().invoke(gaps, ["--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Unresolved extraction failures" in result.output
+    assert "Account 11111111 / SLEEP" in result.output
+    assert "2 gap(s), 3 failure(s)" in result.output
+    assert "2025-01-02" in result.output
+    assert "2025-01-05" in result.output
+    assert "RuntimeError: newer" in result.output
+    assert "Account 22222222 / STRESS" in result.output
+
+
+def test_gaps_command_scopes_by_accounts(tmp_path):
+    """
+    --accounts filters the gaps listing to the given user IDs.
+    """
+    from garmin_health_data.cli import gaps
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+    _seed_ledger(
+        db_path,
+        [
+            _make_failure("11111111", "SLEEP", "2025-01-02"),
+            _make_failure("22222222", "STRESS", "2025-01-03"),
+        ],
+    )
+
+    result = CliRunner().invoke(
+        gaps, ["--db-path", str(db_path), "--accounts", "11111111"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Account 11111111" in result.output
+    assert "Account 22222222" not in result.output
+
+
+def test_gaps_command_empty_ledger(tmp_path):
+    """
+    An empty ledger reports success rather than an empty table.
+    """
+    from garmin_health_data.cli import gaps
+
+    db_path = tmp_path / "test.db"
+    create_tables(str(db_path))
+
+    result = CliRunner().invoke(gaps, ["--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "No unresolved extraction failures" in result.output
+
+
+def test_gaps_command_missing_database(tmp_path):
+    """
+    A missing database exits 1 with the standard hint.
+    """
+    from garmin_health_data.cli import gaps
+
+    result = CliRunner().invoke(gaps, ["--db-path", str(tmp_path / "nope.db")])
+
+    assert result.exit_code == 1
+    assert "Database not found" in result.output

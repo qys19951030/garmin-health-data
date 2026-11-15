@@ -16,6 +16,7 @@ from sqlalchemy import text
 from garmin_health_data.__version__ import __version__
 from garmin_health_data.auth import (
     bootstrap_from_ticket,
+    discover_accounts,
     ensure_authenticated,
     get_credentials,
     manual_auth,
@@ -26,11 +27,15 @@ from garmin_health_data.db import (
     create_tables,
     database_exists,
     get_database_size,
+    get_earliest_unresolved_failure_date,
     get_last_update_dates,
     get_latest_date,
     get_record_counts,
     get_session,
+    get_unresolved_failure_summary,
     initialize_database,
+    record_extraction_failures,
+    resolve_extraction_failures,
 )
 from garmin_health_data.extractor import extract as extract_data
 from garmin_health_data.lifecycle import (
@@ -108,6 +113,50 @@ def _is_interactive() -> bool:
     :return: True when attached to an interactive terminal, False otherwise.
     """
     return sys.stdin.isatty()
+
+
+# How far back the automatic gap backfill may reach. Older unresolved failures
+# stay in the gap ledger for manual handling (explicit --start-date run) instead
+# of silently triggering a full-history re-pull.
+_GAP_BACKFILL_LOOKBACK_DAYS = 30
+
+
+def _compute_gap_start_dates(
+    db_path: str, base_start, accounts_list: Optional[list]
+) -> dict:
+    """
+    Compute per-account gap-backfill start dates from the failure ledger.
+
+    For each extractable account, the earliest unresolved per-day failure within the
+    look-back horizon becomes its start date when it precedes the global auto-detected
+    start. Accounts without unresolved gaps keep the global start (they are simply
+    absent from the returned dict), so one lagging account never drags the others into a
+    re-pull. Failures older than the horizon stay ledgered but do not move the window.
+
+    :param db_path: Path to the SQLite database file.
+    :param base_start: Global auto-detected start date (a ``date``).
+    :param accounts_list: Optional ``--accounts`` filter (list of user_id strings); None
+        means all discovered accounts.
+    :return: Dict mapping user_id (string) to its gap-backfill start date.
+    """
+    try:
+        discovered = discover_accounts()
+    except (FileNotFoundError, NotADirectoryError, RuntimeError):
+        # Discovery problems are reported by the extractor itself; the gap
+        # pass must not abort the run before it even starts.
+        return {}
+    user_ids = [uid for uid, _ in discovered]
+    if accounts_list:
+        filter_set = set(accounts_list)
+        user_ids = [uid for uid in user_ids if uid in filter_set]
+
+    horizon = datetime.now().date() - timedelta(days=_GAP_BACKFILL_LOOKBACK_DAYS)
+    starts = {}
+    for uid in user_ids:
+        earliest = get_earliest_unresolved_failure_date(db_path, uid, since=horizon)
+        if earliest is not None and earliest < base_start:
+            starts[uid] = earliest
+    return starts
 
 
 @cli.command()
@@ -410,6 +459,7 @@ def extract(
 
     # Date auto-detection and extract-only logging are skipped when running
     # in --process-only mode (no API calls, dates would be unused).
+    account_start_dates: dict = {}
     if not process_only:
         # Auto-detect start date if not provided.
         if start_date is None:
@@ -434,6 +484,22 @@ def extract(
                     click.style(
                         f"📅 Using default start date: "
                         f"{format_date(start_date.date())} (30 days ago)",
+                        fg="cyan",
+                    )
+                )
+
+            # Gap backfill: accounts with unresolved per-day failures in the
+            # ledger get an earlier, per-account start (bounded by the
+            # look-back horizon); the other accounts keep the global start.
+            # Skipped entirely when the user gave an explicit --start-date.
+            account_start_dates = _compute_gap_start_dates(
+                db_path, start_date.date(), accounts_list
+            )
+            for gap_uid, gap_start in sorted(account_start_dates.items()):
+                click.echo(
+                    click.style(
+                        f"🩹 Account {gap_uid}: backfilling unresolved "
+                        f"failures from {format_date(gap_start)}",
                         fg="cyan",
                     )
                 )
@@ -526,6 +592,7 @@ def extract(
                     data_interval_end=format_date(end_date.date()),
                     data_types=data_types_list,
                     accounts=accounts_list,
+                    account_start_dates=account_start_dates or None,
                 )
 
                 garmin_files = result.get("garmin_files", 0)
@@ -539,6 +606,30 @@ def extract(
                 click.echo(f"   • Garmin data files: {format_count(garmin_files)}")
                 click.echo(f"   • Activity files: {format_count(activity_files)}")
                 click.echo()
+
+                # Ledger this run's failures and resolve the gaps it
+                # backfilled, so the next auto-detected start reflects what is
+                # still missing. Recording precedes resolving: a success in
+                # this run clears failures from previous runs.
+                ledgered = record_extraction_failures(
+                    db_path, result.get("failures", [])
+                )
+                resolved = resolve_extraction_failures(
+                    db_path, result.get("successes", [])
+                )
+                if ledgered:
+                    click.secho(
+                        f"📝 Recorded {ledgered} extraction failure(s) to the "
+                        f"gap ledger (inspect with 'garmin gaps').",
+                        fg="yellow",
+                    )
+                if resolved:
+                    click.secho(
+                        f"🩹 Resolved {resolved} previously-recorded gap(s).",
+                        fg="cyan",
+                    )
+                if ledgered or resolved:
+                    click.echo()
 
             if extract_only:
                 _print_extraction_failures(result.get("failures", []))
@@ -1012,6 +1103,76 @@ def verify(ctx: click.Context, db_path: str) -> None:
             click.secho(f"❌ Database integrity check failed: {error}", fg="red")
         ctx.exit(1)
 
+    click.echo()
+
+
+@cli.command()
+@click.option(
+    "--db-path",
+    type=click.Path(),
+    default="garmin_data.db",
+    help="Path to SQLite database file.",
+)
+@click.option(
+    "--accounts",
+    multiple=True,
+    help="Garmin user IDs to scope to (comma-separated or repeated). "
+    "Examples: --accounts 123,456 or --accounts 123 --accounts 456. "
+    "Shows all accounts if not specified.",
+)
+@click.pass_context
+def gaps(ctx: click.Context, db_path: str, accounts: tuple):
+    """
+    List unresolved extraction failures (the gap ledger) by account and data type.
+
+    Every extraction failure is recorded in the database with its occurrence count and
+    last error. Unresolved per-day gaps are backfilled automatically by the next 'garmin
+    extract' (up to 30 days back); older gaps need an explicit --start-date run.
+    Resolved rows stay in the table for inspection but are not shown here.
+    """
+    if not database_exists(db_path):
+        click.secho(f"❌ Database not found: {db_path}", fg="red")
+        click.echo("   Run 'garmin extract' to create a new database.")
+        ctx.exit(1)
+
+    accounts_list = _parse_accounts_option(accounts)
+    summary = get_unresolved_failure_summary(db_path, user_ids=accounts_list)
+
+    click.echo()
+    if not summary:
+        click.secho("✅ No unresolved extraction failures.", fg="green")
+        click.echo()
+        return
+
+    click.echo(
+        click.style(
+            "🕳️  Unresolved extraction failures (gap ledger):",
+            fg="yellow",
+            bold=True,
+        )
+    )
+    click.echo()
+    for group in summary:
+        earliest = (
+            format_date(group["earliest_date"]) if group["earliest_date"] else "—"
+        )
+        latest = format_date(group["latest_date"]) if group["latest_date"] else "—"
+        click.echo(
+            f"   • Account {group['user_id']} / {group['data_type']}: "
+            f"{group['entries']} gap(s), {group['failure_count']} failure(s), "
+            f"dates {earliest} → {latest}"
+        )
+        click.echo(f"       Last error: {group['last_error']}")
+    click.echo()
+    click.echo("💡 Next steps:")
+    click.echo(
+        "   • Per-day gaps up to 30 days old are backfilled automatically "
+        "by the next 'garmin extract'."
+    )
+    click.echo(
+        "   • Older gaps need an explicit range: "
+        "garmin extract --start-date YYYY-MM-DD --end-date YYYY-MM-DD"
+    )
     click.echo()
 
 
